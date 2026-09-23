@@ -567,6 +567,46 @@ export const releaseSession = (sessionId: number): void => {
   activeSessions.delete(sessionId);
 };
 
+const loraAdapters = new Set<number>();
+
+/**
+ * create a LoRA adapter from a buffer in the LoRA adapter format.
+ *
+ * @param adapterData - the LoRA adapter data.
+ * @returns the LoRA adapter ID
+ */
+export const createLoraAdapter = (adapterData: Uint8Array): number => {
+  const wasm = getInstance();
+  const dataOffset = wasm._malloc(adapterData.byteLength);
+  if (dataOffset === 0) {
+    throw new Error(`Can't create a LoRA adapter. failed to allocate a buffer of size ${adapterData.byteLength}.`);
+  }
+
+  try {
+    wasm.HEAPU8.set(adapterData, dataOffset);
+    const adapterHandle = wasm._OrtCreateLoraAdapter(dataOffset, adapterData.byteLength);
+    if (adapterHandle === 0) {
+      checkLastError("Can't create a LoRA adapter.");
+    }
+    loraAdapters.add(adapterHandle);
+    return adapterHandle;
+  } finally {
+    // the data is copied by ORT, so it can be freed here.
+    wasm._free(dataOffset);
+  }
+};
+
+export const releaseLoraAdapter = (adapterId: number): void => {
+  const wasm = getInstance();
+  if (!loraAdapters.has(adapterId)) {
+    throw new Error(`cannot release LoRA adapter. invalid adapter id: ${adapterId}`);
+  }
+  if (wasm._OrtReleaseLoraAdapter(adapterId) !== 0) {
+    checkLastError("Can't release LoRA adapter.");
+  }
+  loraAdapters.delete(adapterId);
+};
+
 export const prepareInputOutputTensor = async (
   tensor: TensorMetadata | null,
   tensorHandles: number[],
@@ -707,6 +747,7 @@ export const run = async (
   outputIndices: number[],
   outputTensors: Array<TensorMetadata | null>,
   options: InferenceSession.RunOptions,
+  loraAdapterIds: readonly number[] = [],
 ): Promise<TensorMetadata[]> => {
   const wasm = getInstance();
   const ptrSize = wasm.PTR_SIZE;
@@ -720,6 +761,20 @@ export const run = async (
   const ioBindingState = session[3];
   const enableGraphCapture = session[4];
   const inputOutputBound = session[5];
+
+  if (loraAdapterIds.length > 0) {
+    // ORT does not apply active LoRA adapters in RunWithBinding(). Fail instead of silently ignoring them.
+    if (ioBindingState) {
+      throw new Error(
+        'LoRA adapters are not supported for a session that uses IO binding, e.g. when an output is preferred to be on GPU.',
+      );
+    }
+    for (const adapterId of loraAdapterIds) {
+      if (!loraAdapters.has(adapterId)) {
+        throw new Error(`cannot run inference. invalid LoRA adapter id: ${adapterId}`);
+      }
+    }
+  }
 
   const inputCount = inputIndices.length;
   const outputCount = outputIndices.length;
@@ -739,7 +794,7 @@ export const run = async (
   const outputNamesOffset = wasm.stackAlloc(outputCount * ptrSize);
 
   try {
-    [runOptionsHandle, runOptionsAllocs] = setRunOptions(options);
+    [runOptionsHandle, runOptionsAllocs] = setRunOptions(options, loraAdapterIds);
 
     TRACE_EVENT_BEGIN('wasm prepareInputOutputTensor');
     // create input tensors
